@@ -1,0 +1,15 @@
+{
+  "name": "extract-features-meyda",
+  "version": "1.0.0",
+  "description": "Extract Meyda features from training WAV files",
+  "main": "extract.js",
+  "scripts": {
+    "start": "node extract.js"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "meyda": "^5.6.3",
+    "node-wav": "^0.0.2"
+  }
+}
