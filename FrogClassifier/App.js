@@ -151,7 +151,6 @@ function computeContrastFrames(segment) {
 }
 
 // Extract 616 features from a 0.3s segment, matching server.py
-let _meydaLogged = false;
 function extractFeatures(segment) {
   Meyda.sampleRate = SR;
   Meyda.numberOfMFCCCoefficients = N_MFCC;
@@ -162,13 +161,6 @@ function extractFeatures(segment) {
     const frame = segment.slice(i, i + FFT_SIZE);
     const mfcc = Meyda.extract('mfcc', frame);
     const centroid = Meyda.extract('spectralCentroid', frame);
-    if (!_meydaLogged && mfcc) {
-      console.log('[MEYDA] numberOfMelBands:', Meyda.numberOfMelBands);
-      console.log('[MEYDA] numberOfMFCCCoefficients:', Meyda.numberOfMFCCCoefficients);
-      console.log('[MEYDA] mfcc.length:', mfcc.length);
-      console.log('[MEYDA] mfcc type:', Object.prototype.toString.call(mfcc));
-      _meydaLogged = true;
-    }
     if (mfcc) mfccFrames.push(Array.from(mfcc));
     centroidFrames.push([centroid ?? 0]);
   }
@@ -194,19 +186,13 @@ function extractFeatures(segment) {
 }
 
 function majorityVote(preds) {
-  // preds is [{label, confidence}, ...]
-  // confidence = window agreement: fraction of windows that voted for the winner
   const filtered = preds.filter(p => p.label !== 'Background');
   if (!filtered.length) {
-    // All windows said Background — confidence = fraction of total that agreed
-    return { label: 'Background', confidence: preds.length / preds.length };
+    return { label: 'Background', confidence: 1 };
   }
   const counts = {};
-  for (const { label } of filtered) {
-    counts[label] = (counts[label] || 0) + 1;
-  }
+  for (const { label } of filtered) counts[label] = (counts[label] || 0) + 1;
   const winner = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
-  // Window agreement: how many non-background windows chose the winner
   return { label: winner, confidence: counts[winner] / filtered.length };
 }
 
@@ -220,72 +206,39 @@ export default function App() {
   const startRecording = async () => {
     try {
       setStatus('Requesting permission...');
-      console.log('[START] Requesting recording permissions...');
-      const permResult = await AudioModule.requestRecordingPermissionsAsync();
-      console.log('[START] Permission result:', JSON.stringify(permResult));
-      const { granted } = permResult;
+      const { granted } = await AudioModule.requestRecordingPermissionsAsync();
       if (!granted) { setStatus('Microphone permission denied'); return; }
 
       setStatus('Starting...');
-      console.log('[START] Setting audio mode...');
       await AudioModule.setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-      console.log('[START] Audio mode set. Calling prepareToRecordAsync...');
       await audioRecorder.prepareToRecordAsync();
-      console.log('[START] prepareToRecordAsync done. audioRecorder state:', JSON.stringify({
-        isRecording: audioRecorder.isRecording,
-        uri: audioRecorder.uri,
-      }));
       audioRecorder.record();
-      console.log('[START] record() called. audioRecorder state:', JSON.stringify({
-        isRecording: audioRecorder.isRecording,
-        uri: audioRecorder.uri,
-      }));
       setStatus('Recording');
     } catch (err) {
       setStatus(`Error: ${err.message}`);
-      console.error('[START] Failed to start recording', err);
     }
   };
 
   const stopRecording = async () => {
     try {
       setStatus('Processing...');
-      console.log('[STOP] stopRecording called. audioRecorder state:', JSON.stringify({
-        isRecording: audioRecorder.isRecording,
-        uri: audioRecorder.uri,
-      }));
-      console.log('[STOP] audioRecorder keys:', Object.keys(audioRecorder));
-
       let uri;
       try {
-        console.log('[STOP] Calling audioRecorder.stop()...');
         const result = await audioRecorder.stop();
-        console.log('[STOP] stop() returned:', JSON.stringify(result));
-        console.log('[STOP] typeof result:', typeof result);
         uri = result?.uri ?? audioRecorder.uri;
-        console.log('[STOP] uri from result:', uri);
-      } catch (stopErr) {
-        console.error('[STOP] stop() threw an error:', stopErr);
-        console.error('[STOP] stop() error name:', stopErr?.name);
-        console.error('[STOP] stop() error message:', stopErr?.message);
-        console.error('[STOP] stop() error stack:', stopErr?.stack);
+      } catch {
         uri = audioRecorder.uri;
-        console.log('[STOP] Falling back to audioRecorder.uri:', uri);
       }
 
       if (!uri) {
-        console.log('[STOP] uri still null, waiting 300ms...');
         await new Promise(res => setTimeout(res, 300));
         uri = audioRecorder.uri;
-        console.log('[STOP] uri after wait:', uri);
       }
 
       if (!uri) { setStatus('Error: no recording URI after stop'); return; }
       await processAudio(uri);
     } catch (err) {
       setStatus(`Error: ${err.message}`);
-      console.error('[STOP] Failed to stop recording', err);
-      console.error('[STOP] error stack:', err?.stack);
     }
   };
 
@@ -336,8 +289,7 @@ export default function App() {
     // Resample if the file isn't at the expected SR (linear interpolation)
     let audioData = monoData;
     if (fileSr !== SR) {
-      console.log(`[WAV] Resampling from ${fileSr} Hz → ${SR} Hz`);
-      const ratio = fileSr / SR;
+        const ratio = fileSr / SR;
       const newLen = Math.round(monoData.length / ratio);
       audioData = new Float32Array(newLen);
       for (let i = 0; i < newLen; i++) {
@@ -349,37 +301,20 @@ export default function App() {
         audioData[i] = a + frac * (b - a);
       }
     }
-    console.log(`[WAV] dataOffset=${dataOffset} sr=${fileSr} bits=${bitsPerSample} ch=${numChannels} samples=${audioData.length}`);
-
     setStatus('Classifying...');
     const totalWindows = Math.max(0, Math.floor((audioData.length - WIN_SAMPLES) / STRIDE_SAMPLES) + 1);
     setProgress(0);
     const windowPredictions = [];
-    let firstFeatures = null;
     let windowIdx = 0;
     for (let start = 0; start + WIN_SAMPLES <= audioData.length; start += STRIDE_SAMPLES) {
       const segment = audioData.slice(start, start + WIN_SAMPLES);
-      const features = extractFeatures(segment);
-      if (!firstFeatures) {
-        firstFeatures = features;
-        const scaled = features.map((v, i) => (v - model.scaler_mean[i]) / model.scaler_scale[i]);
-        const kernelVals = model.support_vectors.map(sv => rbfKernel(scaled, sv, model.gamma));
-        const maxK = Math.max(...kernelVals);
-        const meanK = kernelVals.reduce((a, b) => a + b, 0) / kernelVals.length;
-        console.log('[FEATURES] count:', features.length);
-        console.log('[FEATURES] first 10 raw:', features.slice(0, 10));
-        console.log('[FEATURES] first 10 scaled:', scaled.slice(0, 10));
-        console.log('[KERNEL] max:', maxK, 'mean:', meanK);
-        console.log('[KERNEL] non-zero count:', kernelVals.filter(v => v > 1e-10).length, '/', kernelVals.length);
-      }
-      windowPredictions.push(predict(features));
+      windowPredictions.push(predict(extractFeatures(segment)));
       windowIdx++;
       setProgress(windowIdx / totalWindows);
       // Yield to UI thread every 5 windows so the progress bar actually renders
       if (windowIdx % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
     setProgress(null);
-    console.log('[PREDICT] window predictions:', windowPredictions);
 
     if (!windowPredictions.length) { setStatus('Audio too short to classify'); return; }
     const { label, confidence } = majorityVote(windowPredictions);
@@ -405,7 +340,6 @@ export default function App() {
       await processAudio(asset.uri);
     } catch (err) {
       setStatus(`Upload error: ${err.message}`);
-      console.error('Failed to upload audio', err);
     }
   };
 
@@ -415,7 +349,6 @@ export default function App() {
       <Button
         title={audioRecorder.isRecording ? 'Stop Recording' : 'Start Recording'}
         onPress={audioRecorder.isRecording ? stopRecording : startRecording}
-        disabled={audioRecorder.isRecording ? false : false}
       />
       <Button title="Upload WAV File" onPress={uploadAudio} disabled={audioRecorder.isRecording} />
       <Text style={styles.status}>{status}</Text>
