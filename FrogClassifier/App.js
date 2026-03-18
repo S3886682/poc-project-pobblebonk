@@ -1,6 +1,8 @@
+import "./global.css";
 import { useState } from 'react';
-import { View, Text, Button, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity } from 'react-native';
 import { useAudioRecorder, AudioModule } from 'expo-audio';
+
 import * as FileSystem from 'expo-file-system/legacy';
 import * as DocumentPicker from 'expo-document-picker';
 import { Buffer } from 'buffer';
@@ -343,26 +345,52 @@ export default function App() {
     }
   };
 
+  const isFrog = prediction && prediction.label !== 'Background';
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Frog Classifier</Text>
-      <Button
-        title={audioRecorder.isRecording ? 'Stop Recording' : 'Start Recording'}
+    <View className="flex-1 bg-gray-50 items-center justify-center gap-4 px-6">
+      <Text className="text-2xl font-bold text-gray-800">Frog Classifier</Text>
+
+      <TouchableOpacity
+        className={`w-56 py-4 rounded-2xl items-center ${audioRecorder.isRecording ? 'bg-red-600' : 'bg-green-700'}`}
         onPress={audioRecorder.isRecording ? stopRecording : startRecording}
-      />
-      <Button title="Upload WAV File" onPress={uploadAudio} disabled={audioRecorder.isRecording} />
-      <Text style={styles.status}>{status}</Text>
+        activeOpacity={0.8}
+      >
+        <Text className="text-white font-semibold text-base">
+          {audioRecorder.isRecording ? 'Stop Recording' : 'Start Recording'}
+        </Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        className={`w-56 py-4 rounded-2xl items-center border-2 border-green-700 ${audioRecorder.isRecording ? 'opacity-40' : 'opacity-100'}`}
+        onPress={uploadAudio}
+        disabled={audioRecorder.isRecording}
+        activeOpacity={0.8}
+      >
+        <Text className="text-green-700 font-semibold text-base">Upload WAV File</Text>
+      </TouchableOpacity>
+
+      {status ? (
+        <Text className="text-gray-500 text-center px-4">{status}</Text>
+      ) : null}
+
       {progress !== null ? (
-        <View style={styles.progressTrack}>
-          <View style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]} />
+        <View className="w-56 h-2 bg-gray-200 rounded-full overflow-hidden">
+          <View
+            className="h-full bg-green-600 rounded-full"
+            style={{ width: `${Math.round(progress * 100)}%` }}
+          />
         </View>
       ) : null}
+
       {prediction ? (
-        <View style={styles.resultBox}>
-          <Text style={[styles.prediction, prediction.label === 'Background' && styles.predictionBackground]}>
-            {prediction.label === 'Background' ? 'No frog detected' : prediction.label}
+        <View className="mt-2 bg-white rounded-2xl px-8 py-6 items-center shadow w-72"
+          style={{ elevation: 3 }}
+        >
+          <Text className={`text-xl font-bold text-center ${isFrog ? 'text-green-700' : 'text-gray-400'}`}>
+            {isFrog ? prediction.label : 'No frog detected'}
           </Text>
-          <Text style={styles.confidence}>
+          <Text className="text-sm text-gray-500 mt-1">
             {Math.round(prediction.confidence * 100)}% confidence
           </Text>
         </View>
@@ -370,15 +398,3 @@ export default function App() {
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center', gap: 16 },
-  title: { fontSize: 24, fontWeight: 'bold' },
-  status: { color: '#666', textAlign: 'center', paddingHorizontal: 16 },
-  resultBox: { alignItems: 'center', gap: 4 },
-  prediction: { fontSize: 20, fontWeight: '700', color: '#2a7' },
-  predictionBackground: { color: '#999' },
-  confidence: { fontSize: 14, color: '#666' },
-  progressTrack: { width: '70%', height: 8, backgroundColor: '#e0e0e0', borderRadius: 4, overflow: 'hidden' },
-  progressFill: { height: '100%', backgroundColor: '#2a7', borderRadius: 4 },
-});

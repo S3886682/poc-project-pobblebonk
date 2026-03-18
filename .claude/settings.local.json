@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"const nw = require\\(''nativewind/package.json''\\); console.log\\(nw.version\\)\")"
+    ]
+  }
+}
