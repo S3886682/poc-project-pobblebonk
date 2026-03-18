@@ -9,17 +9,23 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "@expo-google-fonts/inter": "^0.4.2",
+    "babel-preset-expo": "^55.0.11",
     "buffer": "^6.0.3",
     "expo": "~54.0.0",
     "expo-audio": "~1.1.1",
+    "expo-blur": "~14.0.0",
     "expo-document-picker": "^55.0.8",
     "expo-file-system": "~19.0.21",
+    "expo-font": "^55.0.4",
+    "expo-haptics": "^55.0.9",
     "expo-status-bar": "~3.0.9",
     "meyda": "^5.6.3",
     "ml-matrix": "^6.12.1",
     "nativewind": "^4.2.3",
     "react": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-safe-area-context": "^5.7.0",
     "tailwindcss": "^3.4.19"
   },
   "private": true
