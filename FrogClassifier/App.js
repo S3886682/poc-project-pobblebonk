@@ -357,6 +357,8 @@ function AppContent() {
   const cloud3      = useRef(new Animated.Value(SW + 80)).current;
   const shakeAnim       = useRef(new Animated.Value(0)).current;
   const resultDropAnim  = useRef(new Animated.Value(1)).current;
+  const textSlideAnim   = useRef(new Animated.Value(300)).current;
+  const labelSlideAnim  = useRef(new Animated.Value(300)).current;
   const progressFadeAnim = useRef(new Animated.Value(0)).current;
   const heroCrossAnim   = useRef(new Animated.Value(1)).current;
   const isMounted      = useRef(false);
@@ -445,6 +447,19 @@ function AppContent() {
     scheduleShake();
     return () => clearTimeout(timeout);
   }, []);
+
+  // Fly new dialogue text in from the right; label follows slightly behind
+  useEffect(() => {
+    textSlideAnim.setValue(300);
+    labelSlideAnim.setValue(300);
+    Animated.parallel([
+      Animated.spring(textSlideAnim,  { toValue: 0, useNativeDriver: true, speed: 16, bounciness: 3 }),
+      Animated.sequence([
+        Animated.delay(90),
+        Animated.spring(labelSlideAnim, { toValue: 0, useNativeDriver: true, speed: 16, bounciness: 3 }),
+      ]),
+    ]).start();
+  }, [prediction]);
 
   const dropAndClearPrediction = (cb) => {
     if (!prediction) { cb?.(); return; }
@@ -674,33 +689,28 @@ function AppContent() {
                 </View>
               </View>
               <Text style={[T.h1, { color: C.brown, marginTop: 3, paddingRight: 88, textShadowColor: 'rgba(61,50,38,0.22)', textShadowOffset: { width: 2, height: 4 }, textShadowRadius: 1 }]}>FrogFinder</Text>
-              {/* Description box — Ribbit label overlaps the top-left */}
+              {/* Unified dialogue box — always visible, text + label fly in on change */}
               <View style={{ marginTop: 14 }}>
-                <View style={styles.ribbitLabel}>
+                <Animated.View style={[styles.ribbitLabel, { transform: [{ translateX: labelSlideAnim }], zIndex: 2 }]}>
                   <Text style={[T.label, { color: C.brown }]}>Ribbit! 🐸</Text>
-                </View>
-                <View style={styles.descriptionBox}>
-                  <Text style={[T.body, { color: C.brownMid }]}>
-                    Point your phone at frog calls to discover who's singing!
-                  </Text>
+                </Animated.View>
+                <View style={[styles.acDialogue, { position: 'absolute', bottom: 3, left: 0, right: 0, backgroundColor: C.brownLight, zIndex: 0 }]} />
+                <View style={[styles.acDialogue, { zIndex: 1 }]}>
+                  <View style={{ overflow: 'hidden' }}>
+                    <Animated.View style={{ transform: [{ translateX: textSlideAnim }] }}>
+                      <Text style={[T.body, { color: C.brownMid, fontSize: 15, lineHeight: 24 }]}>
+                        {prediction
+                          ? (isFrog
+                              ? <>{'Wowie!! I found a friend out there~ 🌿\nIt sounds like a '}<Text style={{ fontFamily: 'Nunito-ExtraBold', color: C.green }}>{getNames(prediction.label).displayName}</Text>{'!'}</>
+                              : "Hmm... I couldn't hear any frogs nearby! 🤔\nTry getting a little closer~")
+                          : "Point your phone at frog calls to discover who's singing!"
+                        }
+                      </Text>
+                    </Animated.View>
+                  </View>
                 </View>
               </View>
             </View>
-
-            {/* AC dialogue — floats between header and button */}
-            {prediction && (
-              <Animated.View style={{ paddingHorizontal: 20, paddingBottom: 8, opacity: resultDropAnim }}>
-                <View style={[styles.acDialogue, { position: 'absolute', bottom: 3, left: 20, right: 20, backgroundColor: C.brownLight, zIndex: 0 }]} />
-                <View style={[styles.acDialogue, { zIndex: 1 }]}>
-                  <Text style={[T.body, { color: C.brown, fontSize: 15, lineHeight: 24 }]}>
-                    {isFrog
-                      ? <>{'Wowie!! I found a friend out there~ 🌿\nIt sounds like a '}<Text style={{ fontFamily: 'Nunito-ExtraBold', color: C.green }}>{getNames(prediction.label).displayName}</Text>{'!'}</>
-                      : "Hmm... I couldn't hear any frogs nearby! 🤔\nTry getting a little closer~"
-                    }
-                  </Text>
-                </View>
-              </Animated.View>
-            )}
 
             {/* Hero — flex:1, crossfades on state transitions */}
             <Animated.View style={[styles.hero, { opacity: heroCrossAnim }]}>
