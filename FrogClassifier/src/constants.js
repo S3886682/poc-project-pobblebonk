@@ -10,6 +10,7 @@ export const RECORDING_OPTIONS = {
   sampleRate: SR,
   numberOfChannels: 1,
   bitRate: SR * 16,
+  isMeteringEnabled: true,
   ios: {
     outputFormat: 'lpcm',
     audioQuality: 127,
@@ -28,9 +29,9 @@ export const RECORDING_OPTIONS = {
 };
 
 export const TEAM = [
-  { name: 'Ashley', role: 'ML Engineer',       initials: 'A' },
-  { name: 'Jordan', role: 'Field Biologist',   initials: 'J' },
-  { name: 'Sam',    role: 'iOS Developer',     initials: 'S' },
+  { name: 'Ashley', role: 'Project Manager',       initials: 'A' },
+  { name: 'Bridget', role: 'UI Designer',   initials: 'B' },
+  { name: 'Daniel',    role: 'ML Engineer',     initials: 'D' },
 ];
 
 export const SIGHTINGS = [

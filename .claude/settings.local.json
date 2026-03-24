@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node -e \"const nw = require\\(''nativewind/package.json''\\); console.log\\(nw.version\\)\")"
+      "Bash(node -e \"const nw = require\\(''nativewind/package.json''\\); console.log\\(nw.version\\)\")",
+      "Bash(node -e \":*)",
+      "Bash(python train_from_meyda_features.py)",
+      "Bash(python -c \":*)",
+      "Bash(npm install:*)",
+      "Bash(xargs ls:*)"
     ]
   }
 }

@@ -1,542 +1,675 @@
 import "./global.css";
-import { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Animated, StatusBar, StyleSheet, ScrollView, Dimensions } from 'react-native';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import {
+  View, Text, TouchableOpacity, StatusBar,
+  StyleSheet, ScrollView, Dimensions, Animated,
+  LayoutAnimation, Platform, UIManager,
+} from 'react-native';
+
+if (Platform.OS === 'android') {
+  UIManager.setLayoutAnimationEnabledExperimental?.(true);
+}
 import { SafeAreaView, SafeAreaProvider } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
-import { useFonts, Nunito_400Regular, Nunito_600SemiBold, Nunito_700Bold, Nunito_800ExtraBold } from '@expo-google-fonts/nunito';
+import {
+  useFonts,
+  Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold,
+} from '@expo-google-fonts/inter';
+import { PlayfairDisplay_700Bold } from '@expo-google-fonts/playfair-display';
 
 import { C, T } from './src/theme';
 import { TEAM, SIGHTINGS } from './src/constants';
 import { getNames, getModelF1, MODEL_NAMES } from './src/classifier';
 import { useAudioProcessor } from './src/useAudioProcessor';
-import { FlatCloud } from './src/FlatCloud';
 
-const { width: SW, height: SH } = Dimensions.get('window');
-const TRACK_W = SW - 40;
+const { width: SW } = Dimensions.get('window');
+const CARD_INNER_W = SW - 40 - 32;
+const BAR_COUNT    = 36;
+
 
 // ---------------------------------------------------------------------------
-// AppContent — UI only, all logic lives in useAudioProcessor
+// StatusTicker — fades between status messages
 // ---------------------------------------------------------------------------
+function StatusTicker({ text }) {
+  const opacity = useRef(new Animated.Value(1)).current;
+  const [shown, setShown] = useState(text);
+
+  useEffect(() => {
+    Animated.timing(opacity, { toValue: 0, duration: 80, useNativeDriver: true }).start(() => {
+      setShown(text);
+      Animated.timing(opacity, { toValue: 1, duration: 120, useNativeDriver: true }).start();
+    });
+  }, [text]);
+
+  return (
+    <Animated.Text style={{ opacity, color: C.green, fontFamily: 'Inter-Medium', fontSize: 12, marginTop: 5 }}>
+      {shown}
+    </Animated.Text>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SelectionWaveform — drag to select region, tap to clear
+// ---------------------------------------------------------------------------
+const FROG_UNPLAYED  = 'rgba(58,104,48,0.50)';
+const DRAG_THRESHOLD = 6;
+
+function SelectionWaveform({
+  samples, frogBuckets, playbackFraction,
+  selection, onSelectionChange, onGestureActiveChange,
+}) {
+  const [w, setW] = useState(0);
+  const pressStartX    = useRef(null);
+  const pressStartFrac = useRef(null);
+  const isDragging     = useRef(false);
+
+  const fracAt = (x) => Math.max(0, Math.min(1, x / w));
+
+  const handleGrant = (e) => {
+    pressStartX.current    = e.nativeEvent.locationX;
+    pressStartFrac.current = fracAt(e.nativeEvent.locationX);
+    isDragging.current     = false;
+    onGestureActiveChange?.(true);
+  };
+
+  const handleMove = (e) => {
+    if (!w) return;
+    const dx = Math.abs(e.nativeEvent.locationX - pressStartX.current);
+    if (dx > DRAG_THRESHOLD || isDragging.current) {
+      isDragging.current = true;
+      const cur   = fracAt(e.nativeEvent.locationX);
+      const start = Math.min(pressStartFrac.current, cur);
+      const end   = Math.max(pressStartFrac.current, cur);
+      onSelectionChange?.({ start, end });
+    }
+  };
+
+  const handleRelease = () => {
+    onGestureActiveChange?.(false);
+    if (!isDragging.current) {
+      // tap with no drag — clear selection
+      onSelectionChange?.(null);
+    }
+    pressStartX.current = null;
+  };
+
+  const hasSel = !!selection && w > 0;
+
+  return (
+    <View
+      onLayout={e => setW(e.nativeEvent.layout.width)}
+      onStartShouldSetResponder={() => true}
+      onMoveShouldSetResponder={() => true}
+      onResponderGrant={handleGrant}
+      onResponderMove={handleMove}
+      onResponderRelease={handleRelease}
+      onResponderTerminate={() => onGestureActiveChange?.(false)}
+      style={{ height: 44, justifyContent: 'flex-end' }}
+    >
+      <View style={{ flexDirection: 'row', alignItems: 'flex-end', height: 36, gap: 1.5 }}>
+        {samples.map((amp, i) => {
+          const frac   = (i + 0.5) / samples.length;
+          const played = frac < playbackFraction;
+          const frog   = frogBuckets?.[i];
+          const inSel  = hasSel && frac >= selection.start && frac <= selection.end;
+          const bg     = frog
+            ? (played ? C.green : FROG_UNPLAYED)
+            : (played ? C.textLight : C.border);
+          return (
+            <View key={i} style={{
+              flex: 1, height: Math.max(2, amp * 36), borderRadius: 1,
+              backgroundColor: bg,
+              opacity: hasSel ? (inSel ? 1 : 0.38) : 1,
+            }} />
+          );
+        })}
+      </View>
+
+      {/* Selection region overlay */}
+      {hasSel && (
+        <View pointerEvents="none" style={{
+          position: 'absolute', top: 0, bottom: 0,
+          left: selection.start * w,
+          width: Math.max(2, (selection.end - selection.start) * w),
+          backgroundColor: 'rgba(58,104,48,0.10)',
+          borderWidth: 1, borderColor: 'rgba(58,104,48,0.40)',
+          borderRadius: 2,
+        }} />
+      )}
+
+      {/* Playback cursor */}
+      {playbackFraction > 0 && w > 0 && (
+        <View style={{
+          position: 'absolute', top: 0, bottom: 0,
+          left: playbackFraction * w - 1, width: 2,
+          borderRadius: 1, backgroundColor: C.text,
+        }} />
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ScrubBar — horizontal slider for seeking
+// ---------------------------------------------------------------------------
+function ScrubBar({ value, totalSecs, onSeek, onGestureActiveChange }) {
+  const [w, setW] = useState(0);
+  const dragging = useRef(false);
+
+  const fracAt = (x) => Math.max(0, Math.min(1, x / w));
+  const seek   = (x) => { if (w) onSeek?.(fracAt(x)); };
+
+  const fmt = (s) => {
+    const t = Math.round(s);
+    return `${Math.floor(t / 60)}:${(t % 60).toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <View style={{ marginTop: 10 }}>
+      <View
+        onLayout={e => setW(e.nativeEvent.layout.width)}
+        onStartShouldSetResponder={() => true}
+        onMoveShouldSetResponder={() => true}
+        onResponderGrant={e => { dragging.current = true; onGestureActiveChange?.(true); seek(e.nativeEvent.locationX); }}
+        onResponderMove={e => { if (dragging.current) seek(e.nativeEvent.locationX); }}
+        onResponderRelease={() => { dragging.current = false; onGestureActiveChange?.(false); }}
+        onResponderTerminate={() => { dragging.current = false; onGestureActiveChange?.(false); }}
+        style={{ height: 28, justifyContent: 'center' }}
+      >
+        {/* Track */}
+        <View style={{ height: 3, backgroundColor: C.border, borderRadius: 99, overflow: 'hidden' }}>
+          <View style={{ height: '100%', width: `${value * 100}%`, backgroundColor: C.green, borderRadius: 99 }} />
+        </View>
+        {/* Thumb */}
+        {w > 0 && (
+          <View style={{
+            position: 'absolute',
+            left: Math.max(0, Math.min(w - 14, value * w - 7)),
+            top: 7,
+            width: 14, height: 14, borderRadius: 7,
+            backgroundColor: C.text,
+            shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
+            shadowOpacity: 0.18, shadowRadius: 2, elevation: 3,
+          }} />
+        )}
+      </View>
+      {/* Time labels */}
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 2 }}>
+        <Text style={[T.label, { color: C.textLight, fontSize: 9, fontVariant: ['tabular-nums'] }]}>
+          {fmt(value * totalSecs)}
+        </Text>
+        <Text style={[T.label, { color: C.textLight, fontSize: 9, fontVariant: ['tabular-nums'] }]}>
+          {fmt(totalSecs)}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Waveform
+// ---------------------------------------------------------------------------
+function Waveform({ isActive, audioLevel = 0 }) {
+  const bars  = useRef(Array.from({ length: BAR_COUNT }, () => new Animated.Value(0.05))).current;
+  // Per-bar gain: arch shape + small fixed random offset so bars differ
+  const gains = useRef(bars.map((_, i) => {
+    const t = (i - BAR_COUNT / 2) / (BAR_COUNT / 2);
+    return 0.45 + 0.55 * (1 - t * t) + (Math.random() * 0.15 - 0.075);
+  })).current;
+
+  useEffect(() => {
+    if (!isActive) {
+      bars.forEach(b => Animated.spring(b, { toValue: 0.05, useNativeDriver: true, speed: 4, bounciness: 0 }).start());
+      return;
+    }
+    bars.forEach((bar, i) => {
+      const target = Math.max(0.05, Math.min(1, audioLevel * gains[i]));
+      Animated.spring(bar, { toValue: target, speed: 50, bounciness: 1, useNativeDriver: true }).start();
+    });
+  }, [audioLevel, isActive]);
+
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', height: 56 }}>
+      {bars.map((bar, i) => (
+        <Animated.View key={i} style={{
+          width: 3, height: 56, borderRadius: 2,
+          backgroundColor: C.pill,
+          transform: [{ scaleY: bar }],
+        }} />
+      ))}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// AppContent
+// ---------------------------------------------------------------------------
+const TABS = [
+  { label: 'About',     page: 0 },
+  { label: 'Record',    page: 1 },
+  { label: 'Sightings', page: 2 },
+];
+
 function AppContent() {
   const [fontsLoaded] = useFonts({
-    'Nunito-Regular':   Nunito_400Regular,
-    'Nunito-SemiBold':  Nunito_600SemiBold,
-    'Nunito-Bold':      Nunito_700Bold,
-    'Nunito-ExtraBold': Nunito_800ExtraBold,
+    'Inter-Regular':        Inter_400Regular,
+    'Inter-Medium':         Inter_500Medium,
+    'Inter-SemiBold':       Inter_600SemiBold,
+    'Inter-Bold':           Inter_700Bold,
+    'PlayfairDisplay-Bold': PlayfairDisplay_700Bold,
   });
+
+  const [activePage, setActivePage] = useState(1);  // start on Record
+  const selectedModel = MODEL_NAMES[0];
+  const [recSeconds,          setRecSeconds]          = useState(0);
+  const [pendingRecord,       setPendingRecord]       = useState(false);
+  const [waveSelection,       setWaveSelection]       = useState(null);
+  const [waveGestureActive,   setWaveGestureActive]   = useState(false);
+  const scrollRef   = useRef(null);
+  const recTimerRef = useRef(null);
 
   const {
     prediction, status, progress, audioDuration, isProcessing,
     expandedResults, setExpandedResults, isRecording,
-    audioUri, isPlaying,
+    audioLevel, waveformSamples, waveformFrogBuckets, waveformFrogLabels,
+    playbackPositionSecs, seekAudio, audioUri, isPlaying,
     progressAnim, progressFadeAnim, resultDropAnim,
     startRecording, stopRecording, uploadAudio, playAudio, cancel,
   } = useAudioProcessor(selectedModel);
 
-  const [activePage,     setActivePage]     = useState(0);
-  const [selectedModel,  setSelectedModel]  = useState(MODEL_NAMES[0]);
-  const pageAnim    = useRef(new Animated.Value(0)).current;
-  const tabPillAnim = useRef(new Animated.Value(0)).current;
-  const pressAnim   = useRef(new Animated.Value(0)).current;
-  const cloud1      = useRef(new Animated.Value(SW + 80)).current;
-  const cloud2      = useRef(new Animated.Value(SW + 80)).current;
-  const cloud3      = useRef(new Animated.Value(SW + 80)).current;
-  const shakeAnim       = useRef(new Animated.Value(0)).current;
-  const heroCrossAnim   = useRef(new Animated.Value(1)).current;
-  const textSlideAnim   = useRef(new Animated.Value(300)).current;
-  const labelSlideAnim  = useRef(new Animated.Value(300)).current;
-  const isMounted       = useRef(false);
-  const pulse1  = useRef(new Animated.Value(1)).current;
-  const pulse2  = useRef(new Animated.Value(1)).current;
-  const opacity1 = useRef(new Animated.Value(0)).current;
-  const opacity2 = useRef(new Animated.Value(0)).current;
-  const loop1 = useRef(null);
-  const loop2 = useRef(null);
-
-  const pressIn  = () => Animated.spring(pressAnim, { toValue: 4, useNativeDriver: true, speed: 60, bounciness: 0 }).start();
-  const pressOut = () => Animated.spring(pressAnim, { toValue: 0, useNativeDriver: true, speed: 20, bounciness: 6 }).start();
-
   const goToPage = (page) => {
     setActivePage(page);
-    Animated.timing(pageAnim,    { toValue: -page * SW, duration: 280, useNativeDriver: true }).start();
-    Animated.spring(tabPillAnim, { toValue: page, useNativeDriver: true, speed: 14, bounciness: 12 }).start();
+    scrollRef.current?.scrollTo({ x: page * SW, animated: true });
   };
 
-  // Recording pulse rings
+  // Start on Record tab (page 1)
+  useEffect(() => {
+    setTimeout(() => scrollRef.current?.scrollTo({ x: SW, animated: false }), 0);
+  }, []);
+
   useEffect(() => {
     if (isRecording) {
-      const makeLoop = (scale, opacity, delay) => {
-        scale.setValue(1); opacity.setValue(0.6);
-        return Animated.loop(Animated.sequence([
-          Animated.delay(delay),
-          Animated.parallel([
-            Animated.timing(scale,   { toValue: 2.8, duration: 1600, useNativeDriver: true }),
-            Animated.timing(opacity, { toValue: 0,   duration: 1600, useNativeDriver: true }),
-          ]),
-          Animated.parallel([
-            Animated.timing(scale,   { toValue: 1, duration: 0, useNativeDriver: true }),
-            Animated.timing(opacity, { toValue: 0.6, duration: 0, useNativeDriver: true }),
-          ]),
-        ]));
-      };
-      loop1.current = makeLoop(pulse1, opacity1, 0);
-      loop2.current = makeLoop(pulse2, opacity2, 700);
-      loop1.current.start();
-      loop2.current.start();
+      setPendingRecord(false);
+      setRecSeconds(0);
+      recTimerRef.current = setInterval(() => setRecSeconds(s => s + 1), 1000);
     } else {
-      loop1.current?.stop(); loop2.current?.stop();
-      opacity1.setValue(0); opacity2.setValue(0);
-      pulse1.setValue(1);   pulse2.setValue(1);
+      clearInterval(recTimerRef.current);
     }
+    return () => clearInterval(recTimerRef.current);
   }, [isRecording]);
 
-  // Drifting clouds
+  // Loop playback within selected region
+  const loopDebounceRef = useRef(0);
   useEffect(() => {
-    const startCloud = (anim, duration, delay) => {
-      anim.setValue(SW + 80);
-      Animated.loop(Animated.sequence([
-        Animated.delay(delay),
-        Animated.timing(anim, { toValue: -160, duration, useNativeDriver: true }),
-        Animated.timing(anim, { toValue: SW + 80, duration: 0, useNativeDriver: true }),
-      ])).start();
-    };
-    startCloud(cloud1, 20000,     0);
-    startCloud(cloud2, 28000,  8000);
-    startCloud(cloud3, 16000, 14000);
-  }, []);
+    if (!waveSelection || !isPlaying || audioDuration <= 0) return;
+    const selEndSec = waveSelection.end * audioDuration;
+    if (playbackPositionSecs >= selEndSec - 0.05) {
+      const now = Date.now();
+      if (now - loopDebounceRef.current > 400) {
+        loopDebounceRef.current = now;
+        seekAudio(waveSelection.start * audioDuration);
+      }
+    }
+  }, [playbackPositionSecs]);
 
-  // Crossfade hero on idle ↔ recording transition (skip when entering processing)
+  // Clear selection when a new recording starts
   useEffect(() => {
-    if (!isMounted.current) { isMounted.current = true; return; }
-    if (isProcessing) return;
-    heroCrossAnim.setValue(0.15);
-    Animated.timing(heroCrossAnim, { toValue: 1, duration: 280, useNativeDriver: true }).start();
-  }, [isProcessing, isRecording]);
+    if (isRecording) setWaveSelection(null);
+  }, [isRecording]);
 
-  // Periodic frog icon shake
-  useEffect(() => {
-    let timeout;
-    const scheduleShake = () => {
-      timeout = setTimeout(() => {
-        Animated.sequence([
-          Animated.timing(shakeAnim, { toValue: -9, duration: 55, useNativeDriver: true }),
-          Animated.timing(shakeAnim, { toValue:  9, duration: 55, useNativeDriver: true }),
-          Animated.timing(shakeAnim, { toValue: -6, duration: 55, useNativeDriver: true }),
-          Animated.timing(shakeAnim, { toValue:  6, duration: 55, useNativeDriver: true }),
-          Animated.timing(shakeAnim, { toValue:  0, duration: 55, useNativeDriver: true }),
-        ]).start(() => scheduleShake());
-      }, 3500 + Math.random() * 3000);
-    };
-    scheduleShake();
-    return () => clearTimeout(timeout);
-  }, []);
-
-  // Slide dialogue text in from right when prediction changes
-  useEffect(() => {
-    textSlideAnim.setValue(300); labelSlideAnim.setValue(300);
-    Animated.parallel([
-      Animated.spring(textSlideAnim,  { toValue: 0, useNativeDriver: true, speed: 16, bounciness: 3 }),
-      Animated.sequence([
-        Animated.delay(90),
-        Animated.spring(labelSlideAnim, { toValue: 0, useNativeDriver: true, speed: 16, bounciness: 3 }),
-      ]),
-    ]).start();
-  }, [prediction]);
+  const firstFrogInSelection = useMemo(() => {
+    if (!waveSelection || !waveformFrogLabels?.length) return null;
+    const n     = waveformFrogLabels.length;
+    const start = Math.floor(waveSelection.start * n);
+    const end   = Math.ceil(waveSelection.end * n);
+    for (let i = start; i <= end && i < n; i++) {
+      if (waveformFrogLabels[i]) return waveformFrogLabels[i];
+    }
+    return null;
+  }, [waveSelection, waveformFrogLabels]);
 
   if (!fontsLoaded) return null;
 
   const isFrog = prediction && prediction.label !== 'Background';
-  const busy   = isProcessing || isRecording;
+  const top    = prediction?.all?.[0] ?? (prediction ? { label: prediction.label, confidence: prediction.confidence } : null);
+  const fmtSec = s => `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
-      <View style={{ flex: 1, overflow: 'hidden' }}>
-        <Animated.View style={[styles.pagesRow, { transform: [{ translateX: pageAnim }] }]}>
-
-          {/* ── PAGE 1: Classifier ── */}
-          <View style={styles.page}>
-            {/* Drifting clouds */}
-            <Animated.View style={[styles.cloud, { top: SH * 0.09, transform: [{ translateX: cloud1 }] }]}><FlatCloud width={120} opacity={0.85} /></Animated.View>
-            <Animated.View style={[styles.cloud, { top: SH * 0.18, transform: [{ translateX: cloud2 }] }]}><FlatCloud width={80}  opacity={0.70} /></Animated.View>
-            <Animated.View style={[styles.cloud, { top: SH * 0.04, transform: [{ translateX: cloud3 }] }]}><FlatCloud width={100} opacity={0.78} /></Animated.View>
-
-            {/* Header */}
-            <View style={{ paddingHorizontal: 24, paddingTop: 8, paddingBottom: 10 }}>
-              {/* Mascot — absolutely positioned, no layout impact */}
-              <View style={{ position: 'absolute', top: 8, right: 24, zIndex: 2 }}>
-                <View style={styles.mascotCircle}>
-                  <Text style={{ fontSize: 36 }}>🐸</Text>
-                </View>
-              </View>
-
-              {/* Field guide badge */}
-              <View style={{ alignSelf: 'flex-start' }}>
-                <View style={[styles.fieldGuideBadge, { position: 'absolute', top: 4, backgroundColor: '#b89a10' }]} />
-                <View style={styles.fieldGuideBadge}>
-                  <Text style={{ fontSize: 14 }}>🐸</Text>
-                  <Text style={[T.label, { color: C.brown, marginLeft: 6 }]}>YOUR FIELD GUIDE</Text>
-                </View>
-              </View>
-
-              <Text style={[T.h1, { color: C.brown, marginTop: 3, paddingRight: 88, textShadowColor: 'rgba(61,50,38,0.22)', textShadowOffset: { width: 2, height: 4 }, textShadowRadius: 1 }]}>
-                FrogFinder
-              </Text>
-
-              {/* Dialogue box — Ribbit label overlaps top-left */}
-              <View style={{ marginTop: 14 }}>
-                <Animated.View style={[styles.ribbitLabel, { transform: [{ translateX: labelSlideAnim }], zIndex: 2 }]}>
-                  <Text style={[T.label, { color: C.brown }]}>Ribbit! 🐸</Text>
-                </Animated.View>
-                <View style={[styles.acDialogue, { position: 'absolute', bottom: 3, left: 0, right: 0, backgroundColor: C.brownLight, zIndex: 0 }]} />
-                <View style={[styles.acDialogue, { zIndex: 1 }]}>
-                  <View style={{ overflow: 'hidden' }}>
-                    <Animated.View style={{ transform: [{ translateX: textSlideAnim }] }}>
-                      <Text style={[T.body, { color: C.brownMid, fontSize: 15, lineHeight: 24 }]}>
-                        {prediction
-                          ? (isFrog
-                              ? <>{'Wowie!! I found a friend out there~ 🌿\nIt sounds like a '}<Text style={{ fontFamily: 'Nunito-ExtraBold', color: C.green }}>{getNames(prediction.label).displayName}</Text>{'!'}</>
-                              : "Hmm... I couldn't hear any frogs nearby! 🤔\nTry getting a little closer~")
-                          : "Point your phone at frog calls to discover who's singing!"
-                        }
-                      </Text>
-                    </Animated.View>
-                  </View>
-                </View>
-              </View>
-            </View>
-
-            {/* Hero — flex:1 so it takes remaining space above the bottom panel */}
-            <Animated.View style={[styles.hero, { opacity: heroCrossAnim }]}>
-              {isProcessing ? (
-                <View style={{ alignItems: 'center', gap: 16 }}>
-                  <View style={{ position: 'relative' }}>
-                    <View style={[styles.recordBtn, styles.recordBtnShadowCancel, { position: 'absolute', top: 4 }]} />
-                    <Animated.View style={{ transform: [{ translateY: pressAnim }] }}>
-                      <TouchableOpacity
-                        onPressIn={pressIn} onPressOut={pressOut}
-                        onPress={cancel}
-                        activeOpacity={1}
-                        style={[styles.recordBtn, styles.recordBtnCancel]}
-                      >
-                        <Ionicons name="close" size={40} color={C.brown} />
-                      </TouchableOpacity>
-                    </Animated.View>
-                  </View>
-                  <Text style={[T.medium, { color: C.brownMid }]}>Stop classifying</Text>
-                </View>
-              ) : (
-                <View style={{ alignItems: 'center' }}>
-                  <View style={styles.btnWrapper}>
-                    <Animated.View style={[styles.ring, { transform: [{ scale: pulse1 }], opacity: opacity1 }]} />
-                    <Animated.View style={[styles.ring, { transform: [{ scale: pulse2 }], opacity: opacity2 }]} />
-                    <View style={{ position: 'relative' }}>
-                      <View style={[styles.recordBtn,
-                        isRecording ? styles.recordBtnShadowActive : styles.recordBtnShadowIdle,
-                        { position: 'absolute', top: 4 }
-                      ]} />
-                      <Animated.View style={{ transform: [{ translateY: pressAnim }] }}>
-                        <TouchableOpacity
-                          onPressIn={pressIn} onPressOut={pressOut}
-                          onPress={() => {
-                            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid);
-                            isRecording ? stopRecording() : startRecording();
-                          }}
-                          activeOpacity={1}
-                          style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnIdle]}
-                        >
-                          <Ionicons name={isRecording ? 'stop' : 'mic'} size={40} color="white" />
-                        </TouchableOpacity>
-                      </Animated.View>
-                    </View>
-                  </View>
-                  <Text style={[T.title, { color: C.brownMid, marginTop: 24 }]}>
-                    {isRecording ? 'Listening for frogs...' : 'Tap to listen!'}
-                  </Text>
-                </View>
-              )}
-            </Animated.View>
-
-            {/* Bottom panel — normal flow so hero flex:1 adjusts naturally */}
-            <View style={styles.bottomPanel}>
-              <ScrollView
-                style={{ maxHeight: SH * 0.33 }}
-                contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 12, paddingBottom: 8, gap: 10 }}
-                showsVerticalScrollIndicator={false}
+      {/* Fixed header + tabs */}
+      <View style={styles.topSection}>
+        <Text style={[T.label, { color: C.textLight, textAlign: 'center', fontSize: 10 }]}>BIOACOUSTICS</Text>
+        <Text style={[T.h1, { color: C.text, textAlign: 'center', marginTop: 2 }]}>FrogFinder</Text>
+        <View style={styles.tabRow}>
+          {TABS.map(tab => {
+            const active = activePage === tab.page;
+            return (
+              <TouchableOpacity
+                key={tab.page}
+                onPress={() => goToPage(tab.page)}
+                activeOpacity={0.75}
+                style={[styles.tabPill, active && styles.tabPillActive]}
               >
-                {/* Progress bar */}
-                {progress !== null && (
-                  <Animated.View style={{
-                    opacity: progressFadeAnim,
-                    transform: [{ translateY: progressFadeAnim.interpolate({ inputRange: [0, 1], outputRange: [32, 0] }) }],
-                  }}>
-                    <Text style={[T.caption, { color: C.brownMid, marginBottom: 8 }]}>
-                      Searching... {Math.round(progress * 100)}%
-                    </Text>
-                    <View style={styles.confTrack}>
-                      <Animated.View style={[styles.confFill, {
-                        width: TRACK_W,
-                        transform: [{ translateX: progressAnim.interpolate({ inputRange: [0, 1], outputRange: [-TRACK_W, 0] }) }],
-                      }]} />
-                    </View>
-                  </Animated.View>
-                )}
+                <Text style={[T.medium, {
+                  fontSize: 13,
+                  color: active ? C.pillText : C.textMid,
+                  fontFamily: active ? 'Inter-SemiBold' : 'Inter-Regular',
+                }]}>
+                  {tab.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
 
-                {/* Result card */}
-                {prediction && (
-                  <Animated.View style={{
-                    opacity: resultDropAnim,
-                    transform: [{ translateY: resultDropAnim.interpolate({ inputRange: [0, 1], outputRange: [50, 0] }) }],
-                  }}>
-                    <View style={styles.resultCard}>
-                      <View style={[styles.resultCardHeader, !isFrog && { backgroundColor: C.redLight }]}>
-                        <Text style={[T.title, { color: C.green }]}>
-                          {isFrog ? '⭐  FOUND A FRIEND!' : '🤔  NO FROGS NEARBY'}
-                        </Text>
-                        {audioDuration > 0 && (
-                          <View style={styles.durationPill}>
-                            <Text style={[T.caption, { color: C.brownMid }]}>{audioDuration}s analysed</Text>
-                          </View>
-                        )}
-                      </View>
+      {/* Pages */}
+      <ScrollView
+        ref={scrollRef}
+        horizontal
+        pagingEnabled
+        scrollEnabled={!waveGestureActive}
+        showsHorizontalScrollIndicator={false}
+        scrollEventThrottle={8}
+        onMomentumScrollEnd={e => setActivePage(Math.round(e.nativeEvent.contentOffset.x / SW))}
+        style={{ flex: 1 }}
+      >
 
-                      {isFrog && (
-                        <View style={{ padding: 16 }}>
-                          {/* Winner row */}
-                          {(() => {
-                            const top = prediction.all?.[0] ?? { label: prediction.label, confidence: prediction.confidence };
-                            const pct = Math.round(top.confidence * 100);
-                            const { displayName, latin } = getNames(top.label);
-                            const f1 = getModelF1(top.label, selectedModel);
-                            return (
-                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
-                                <Animated.View style={{ transform: [{ rotate: shakeAnim.interpolate({ inputRange: [-9, 0, 9], outputRange: ['-12deg', '0deg', '12deg'] }) }] }}>
-                                  <View style={styles.frogSquareLarge}>
-                                    <Text style={{ fontSize: 40 }}>🐸</Text>
-                                  </View>
-                                </Animated.View>
-                                <View style={{ flex: 1 }}>
-                                  <Text style={[T.h3, { color: C.brown }]}>{displayName}</Text>
-                                  {latin && <Text style={[T.caption, { color: C.brown, fontStyle: 'italic', opacity: 0.55, marginTop: 2 }]}>{latin}</Text>}
-                                  {f1 !== null && <Text style={[T.caption, { color: C.green, opacity: 0.8, marginTop: 2 }]}>Model accuracy: {Math.round(f1 * 100)}%</Text>}
-                                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 }}>
-                                    <View style={[styles.confTrack, { flex: 1 }]}>
-                                      <View style={[styles.confFill, { width: `${pct}%` }]} />
-                                    </View>
-                                    <Text style={[T.title, { color: C.green, minWidth: 42, textAlign: 'right' }]}>{pct}%</Text>
-                                  </View>
-                                </View>
-                              </View>
-                            );
-                          })()}
-
-                          {/* Expand/collapse other species */}
-                          {prediction.all.length > 1 && (
-                            <>
-                              {expandedResults && (
-                                <ScrollView style={{ maxHeight: 200, marginTop: 4 }} nestedScrollEnabled showsVerticalScrollIndicator={false}>
-                                  {prediction.all.slice(1, 5).map((item, idx) => {
-                                    const pct = Math.round(item.confidence * 100);
-                                    const { displayName: dn, latin: lt } = getNames(item.label);
-                                    return (
-                                      <View key={item.label}>
-                                        {idx === 0 && (
-                                          <View style={styles.leafDivider}>
-                                            <View style={styles.leafLine} />
-                                            <Text style={{ fontSize: 16 }}>🌿</Text>
-                                            <View style={styles.leafLine} />
-                                          </View>
-                                        )}
-                                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 12 }}>
-                                          <View style={styles.frogSquareSmall}>
-                                            <Text style={{ fontSize: 28 }}>🐸</Text>
-                                          </View>
-                                          <View style={{ flex: 1 }}>
-                                            <Text style={[T.title, { color: C.brown }]}>{dn}</Text>
-                                            {lt && <Text style={[T.caption, { color: C.brown, fontStyle: 'italic', opacity: 0.55, marginTop: 2 }]}>{lt}</Text>}
-                                            {(() => { const f1 = getModelF1(item.label, selectedModel); return f1 !== null ? <Text style={[T.caption, { color: C.green, opacity: 0.7, marginTop: 2 }]}>Model accuracy: {Math.round(f1 * 100)}%</Text> : null; })()}
-                                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 }}>
-                                              <View style={[styles.confTrack, { flex: 1 }]}>
-                                                <View style={[styles.confFill, { width: `${pct}%`, backgroundColor: C.yellow }]} />
-                                              </View>
-                                              <Text style={[T.title, { color: C.yellowDark, minWidth: 42, textAlign: 'right' }]}>{pct}%</Text>
-                                            </View>
-                                          </View>
-                                        </View>
-                                      </View>
-                                    );
-                                  })}
-                                </ScrollView>
-                              )}
-                              <TouchableOpacity onPress={() => setExpandedResults(e => !e)} activeOpacity={0.7} style={styles.expandBtn}>
-                                <Text style={[T.caption, { color: C.brownLight }]}>
-                                  {expandedResults ? 'Hide others' : `${Math.min(prediction.all.length - 1, 4)} others nearby`}
-                                </Text>
-                                <Ionicons name={expandedResults ? 'chevron-up' : 'chevron-down'} size={14} color={C.brownLight} />
-                              </TouchableOpacity>
-                            </>
-                          )}
-                        </View>
-                      )}
-                    </View>
-                  </Animated.View>
-                )}
-
-                {status ? (
-                  <Text style={[T.caption, { color: C.brownMid, textAlign: 'center', opacity: 0.7 }]}>{status}</Text>
-                ) : null}
-              </ScrollView>
-
-              {/* Upload / Play / Model — pinned at bottom of panel */}
-              <View style={styles.uploadRow}>
-                <View style={styles.dashedSeparator} />
-
-                {/* Upload + Play row */}
-                <View style={{ flexDirection: 'row', gap: 8 }}>
-                  <TouchableOpacity
-                    onPress={uploadAudio}
-                    disabled={busy}
-                    activeOpacity={0.7}
-                    style={[styles.uploadBtn, { flex: 1 }, busy && styles.uploadBtnDisabled]}
-                  >
-                    <Text style={{ fontSize: 16 }}>☁️</Text>
-                    <Text style={[T.medium, { color: C.brownMid, marginLeft: 8 }]}>Upload</Text>
-                  </TouchableOpacity>
-
-                  {audioUri && (
-                    <TouchableOpacity
-                      onPress={playAudio}
-                      disabled={isProcessing}
-                      activeOpacity={0.7}
-                      style={[styles.uploadBtn, styles.playBtn, isProcessing && styles.uploadBtnDisabled]}
-                    >
-                      <Ionicons
-                        name={isPlaying ? 'pause' : 'play'}
-                        size={18}
-                        color={C.green}
-                      />
-                      <Text style={[T.medium, { color: C.green, marginLeft: 6 }]}>
-                        {isPlaying ? 'Pause' : 'Play'}
-                      </Text>
-                    </TouchableOpacity>
-                  )}
-                </View>
-
-                {/* Model picker */}
-                <View style={styles.modelRow}>
-                  <Text style={[T.caption, { color: C.brownLight, marginRight: 8 }]}>Model</Text>
-                  <View style={{ flexDirection: 'row', gap: 6, flexWrap: 'wrap' }}>
-                    {MODEL_NAMES.map(name => {
-                      const active = name === selectedModel;
-                      return (
-                        <TouchableOpacity
-                          key={name}
-                          onPress={() => setSelectedModel(name)}
-                          disabled={busy}
-                          activeOpacity={0.7}
-                          style={[styles.modelPill, active && styles.modelPillActive]}
-                        >
-                          <Text style={[T.caption, { color: active ? C.green : C.brownLight, fontFamily: active ? 'Nunito-Bold' : 'Nunito-Regular' }]}>
-                            {name}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-                </View>
-              </View>
-            </View>
-          </View>
-
-          {/* ── PAGE 2: About ── */}
+          {/* Page 0: About */}
           <View style={styles.page}>
-            <View style={{ paddingHorizontal: 24, paddingTop: 16, paddingBottom: 8 }}>
-              <View style={[styles.fieldGuideBadge, { alignSelf: 'flex-start' }]}>
-                <Text style={{ fontSize: 14 }}>🌿</Text>
-                <Text style={[T.label, { color: C.brown, marginLeft: 6 }]}>LEARN MORE</Text>
-              </View>
-              <Text style={[T.h1, { color: C.brown, marginTop: 8 }]}>About</Text>
-            </View>
-
-            <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ padding: 24, gap: 16 }}>
-              <View style={styles.aboutCard}>
-                <Text style={[T.label, { color: C.green, marginBottom: 8 }]}>OUR MISSION</Text>
-                <Text style={[T.body, { color: C.brownMid }]}>
+            <ScrollView contentContainerStyle={{ padding: 20, gap: 14, paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+<View style={styles.card}>
+                <Text style={[T.label, { color: C.green, marginBottom: 10 }]}>PROJECT</Text>
+                <Text style={[T.body, { color: C.textMid }]}>
                   FrogFinder uses on-device machine learning to identify frog species from their calls — no internet required.
                   By crowdsourcing detections, we help researchers track frog populations and detect early signs of habitat stress.
                 </Text>
               </View>
-
-              <View style={styles.aboutCard}>
-                <Text style={[T.label, { color: C.green, marginBottom: 12 }]}>THE TEAM</Text>
-                {TEAM.map((member) => (
+              <View style={styles.card}>
+                <Text style={[T.label, { color: C.green, marginBottom: 12 }]}>TEAM</Text>
+                {TEAM.map(member => (
                   <View key={member.name} style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
                     <View style={styles.avatar}>
                       <Text style={[T.title, { color: C.green }]}>{member.initials}</Text>
                     </View>
                     <View style={{ marginLeft: 12 }}>
-                      <Text style={[T.title, { color: C.brown }]}>{member.name}</Text>
-                      <Text style={[T.caption, { color: C.brownMid }]}>{member.role}</Text>
+                      <Text style={[T.title, { color: C.text }]}>{member.name}</Text>
+                      <Text style={[T.caption, { color: C.textMid }]}>{member.role}</Text>
                     </View>
-                  </View>
-                ))}
-              </View>
-
-              <View style={styles.aboutCard}>
-                <Text style={[T.label, { color: C.green, marginBottom: 12 }]}>RECENT SIGHTINGS</Text>
-                {SIGHTINGS.map((s, i) => (
-                  <View key={i} style={[{ paddingBottom: 12 }, i < SIGHTINGS.length - 1 && styles.sightingDivider]}>
-                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <Text style={[T.medium, { color: C.brown, flex: 1, marginRight: 8 }]}>{s.species}</Text>
-                      <View style={styles.badge}>
-                        <Text style={[T.label, { color: C.green }]}>{s.confidence}%</Text>
-                      </View>
-                    </View>
-                    <Text style={[T.caption, { color: C.brownMid, marginTop: 3 }]}>
-                      {s.location} · {s.date}
-                    </Text>
                   </View>
                 ))}
               </View>
             </ScrollView>
           </View>
 
-        </Animated.View>
-      </View>
+          {/* Page 1: Record */}
+          <View style={styles.page}>
+            {(isRecording || isProcessing || !!prediction || pendingRecord) ? (
+              /* Cards */
+              <ScrollView contentContainerStyle={{ padding: 20, gap: 12 }} showsVerticalScrollIndicator={false}>
 
-      {/* Tab bar — SafeAreaView fills home-indicator gap */}
-      <SafeAreaView edges={['bottom']} style={{ backgroundColor: C.tabBg }}>
-        <View style={styles.tabBar}>
-          <Animated.View style={[styles.tabPill, {
-            transform: [{ translateX: tabPillAnim.interpolate({ inputRange: [0, 1], outputRange: [4, SW / 2 + 4] }) }],
-          }]} />
-          {[
-            { icon: 'leaf-outline',               label: 'Identify', page: 0 },
-            { icon: 'information-circle-outline', label: 'About',    page: 1 },
-          ].map(({ icon, label, page }) => {
-            const active = activePage === page;
-            return (
-              <TouchableOpacity
-                key={page}
-                onPress={() => goToPage(page)}
-                disabled={busy}
-                style={styles.tabItem}
-                activeOpacity={0.7}
-              >
-                <Ionicons name={icon} size={22} color={active ? C.green : C.brownLight} />
-                <Text style={[T.caption, {
-                  fontFamily: active ? 'Nunito-Bold' : 'Nunito-Regular',
-                  fontSize: 11,
-                  color: active ? C.green : C.brownLight,
-                  marginTop: 3,
-                }]}>
-                  {label}
+                {/* Card 1: recording / processing / analysed header */}
+                <View style={styles.card}>
+                  {isRecording && (<>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                        <View style={styles.recDot} />
+                        <Text style={[T.title, { color: C.text }]}>Recording...</Text>
+                      </View>
+                      <Text style={[T.caption, { color: C.textMid, fontVariant: ['tabular-nums'] }]}>{fmtSec(recSeconds)}</Text>
+                    </View>
+                    <Waveform isActive={true} audioLevel={audioLevel} />
+                  </>)}
+
+                  {isProcessing && (<>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                        <Ionicons name="analytics-outline" size={18} color={C.green} />
+                        <Text style={[T.title, { color: C.text }]}>Analysing audio</Text>
+                      </View>
+                      {progress !== null && (
+                        <Text style={[T.caption, { color: C.textMid }]}>{Math.round(progress * 100)}%</Text>
+                      )}
+                    </View>
+                    <StatusTicker text={status || 'Starting...'} />
+                    {waveformSamples.length > 0 && (
+                      <View style={{ flexDirection: 'row', alignItems: 'flex-end', height: 36, gap: 1.5, marginTop: 14 }}>
+                        {waveformSamples.map((amp, i) => {
+                          const analysed = progress !== null && i < progress * waveformSamples.length;
+                          return (
+                            <View key={i} style={{
+                              flex: 1, height: Math.max(2, amp * 36),
+                              borderRadius: 1, backgroundColor: analysed ? C.green : C.border,
+                            }} />
+                          );
+                        })}
+                      </View>
+                    )}
+                    {progress !== null && (
+                      <Animated.View style={{ opacity: progressFadeAnim, marginTop: 10 }}>
+                        <View style={styles.confTrack}>
+                          <Animated.View style={[styles.confFill, {
+                            width: CARD_INNER_W,
+                            transform: [{ translateX: progressAnim.interpolate({ inputRange: [0, 1], outputRange: [-CARD_INNER_W, 0] }) }],
+                          }]} />
+                        </View>
+                      </Animated.View>
+                    )}
+                  </>)}
+
+                  {!isRecording && !isProcessing && prediction && (
+                    <Animated.View style={{ opacity: resultDropAnim }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                          <View style={styles.micCircle}>
+                            <Ionicons name="mic-outline" size={13} color={C.textMid} />
+                          </View>
+                          <View>
+                            <Text style={[T.caption, { color: C.textMid, fontStyle: 'italic', fontSize: 12 }]}>Recording analysed</Text>
+                            {audioDuration > 0 && (
+                              <Text style={[T.caption, { color: C.textLight, fontSize: 11 }]}>{audioDuration}s · just now</Text>
+                            )}
+                          </View>
+                        </View>
+                        {firstFrogInSelection && (
+                          <View style={{ alignItems: 'flex-end', maxWidth: 120 }}>
+                            <Text style={[T.label, { color: C.textLight, fontSize: 9 }]}>IN SELECTION</Text>
+                            <Text style={[T.caption, { color: C.green, fontSize: 11, fontFamily: 'Inter-Medium' }]} numberOfLines={1}>
+                              {getNames(firstFrogInSelection).displayName}
+                            </Text>
+                          </View>
+                        )}
+                      </View>
+                      {waveformSamples.length > 0 && (
+                        <View style={{ marginTop: 12 }}>
+                          <SelectionWaveform
+                            samples={waveformSamples}
+                            frogBuckets={waveformFrogBuckets}
+                            playbackFraction={audioDuration > 0 ? playbackPositionSecs / audioDuration : 0}
+                            selection={waveSelection}
+                            onSelectionChange={setWaveSelection}
+                            onGestureActiveChange={setWaveGestureActive}
+                          />
+                          <Text style={[T.label, { color: C.textLight, fontSize: 9, marginTop: 3 }]}>
+                            {waveSelection ? 'LOOPING · TAP TO CLEAR' : 'DRAG TO SELECT LOOP REGION · GREEN = FROG'}
+                          </Text>
+                          <ScrubBar
+                            value={audioDuration > 0 ? playbackPositionSecs / audioDuration : 0}
+                            totalSecs={audioDuration}
+                            onSeek={frac => seekAudio(frac * audioDuration)}
+                            onGestureActiveChange={setWaveGestureActive}
+                          />
+                        </View>
+                      )}
+                    </Animated.View>
+                  )}
+                </View>
+
+                {/* Card 2: species classification */}
+                {!isRecording && !isProcessing && prediction && (() => {
+                  const pct = Math.round(top.confidence * 100);
+                  const { displayName, latin } = getNames(top.label);
+                  const f1 = getModelF1(top.label, selectedModel);
+                  return (
+                    <Animated.View style={{ opacity: resultDropAnim }}>
+                      <View style={styles.card}>
+                        {isFrog && top ? (<>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 12 }}>
+                            <View style={styles.frogThumb}>
+                              <Text style={{ fontSize: 36 }}>🐸</Text>
+                            </View>
+                            <View style={{ flex: 1 }}>
+                              <View style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                                <Text style={[T.h3, { color: C.text, flex: 1, marginRight: 8 }]} numberOfLines={2}>{displayName}</Text>
+                                <Text style={[T.h3, { color: C.green }]}>{pct}%</Text>
+                              </View>
+                              {latin && <Text style={[T.caption, { color: C.textMid, fontStyle: 'italic', marginTop: 2 }]}>{latin}</Text>}
+                            </View>
+                          </View>
+                          {f1 !== null && f1 > 0 && (
+                            <Text style={[T.caption, { color: C.green, marginTop: 3 }]}>Model F1: {Math.round(f1 * 100)}%</Text>
+                          )}
+                          <View style={[styles.confTrack, { marginTop: 10 }]}>
+                            <View style={[styles.confFill, { width: `${pct}%` }]} />
+                          </View>
+                          {(prediction.all?.length ?? 0) > 1 && (<>
+                            {expandedResults && prediction.all.slice(1, 5).map(item => {
+                              const p = Math.round(item.confidence * 100);
+                              const { displayName: dn, latin: lt } = getNames(item.label);
+                              const f = getModelF1(item.label, selectedModel);
+                              return (
+                                <View key={item.label}>
+                                  <View style={styles.divider} />
+                                  <View style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                                    <Text style={[T.h3, { color: C.text, flex: 1, marginRight: 10, fontSize: 18 }]} numberOfLines={1}>{dn}</Text>
+                                    <Text style={[T.title, { color: C.amber }]}>{p}%</Text>
+                                  </View>
+                                  {lt && <Text style={[T.caption, { color: C.textMid, fontStyle: 'italic', marginTop: 2 }]}>{lt}</Text>}
+                                  {f !== null && f > 0 && (
+                                    <Text style={[T.caption, { color: C.green, marginTop: 2 }]}>Model F1: {Math.round(f * 100)}%</Text>
+                                  )}
+                                  <View style={[styles.confTrack, { marginTop: 6 }]}>
+                                    <View style={[styles.confFill, { width: `${p}%`, backgroundColor: C.amber }]} />
+                                  </View>
+                                </View>
+                              );
+                            })}
+                            <TouchableOpacity
+                              onPress={() => setExpandedResults(e => !e)}
+                              activeOpacity={0.7}
+                              style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingTop: 12 }}
+                            >
+                              <Text style={[T.caption, { color: C.textLight }]}>
+                                {expandedResults ? 'Hide alternatives' : `${Math.min(prediction.all.length - 1, 4)} alternative${prediction.all.length > 2 ? 's' : ''}`}
+                              </Text>
+                              <Ionicons name={expandedResults ? 'chevron-up' : 'chevron-down'} size={13} color={C.textLight} />
+                            </TouchableOpacity>
+                          </>)}
+                        </>) : (
+                          <Text style={[T.title, { color: C.textMid }]}>No species detected</Text>
+                        )}
+                      </View>
+                    </Animated.View>
+                  );
+                })()}
+
+                {status && !isProcessing ? <Text style={[T.caption, { color: C.textLight, textAlign: 'center' }]}>{status}</Text> : null}
+              </ScrollView>
+            ) : (
+              /* Idle */
+              <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 40 }}>
+                <Text style={{ fontSize: 72, marginBottom: 20 }}>🐸</Text>
+                <Text style={[T.h3, { color: C.text, textAlign: 'center' }]}>Identify a frog</Text>
+                <Text style={[T.body, { color: C.textMid, textAlign: 'center', marginTop: 10 }]}>
+                  Tap Record and point your microphone toward frog calls, or upload an audio file.
                 </Text>
-              </TouchableOpacity>
-            );
-          })}
+              </View>
+            )}
+          </View>
+
+          {/* Page 2: Sightings */}
+          <View style={styles.page}>
+            <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+              <Text style={[T.label, { color: C.textLight, marginBottom: 16 }]}>RECENT DETECTIONS</Text>
+              {SIGHTINGS.map((s, i) => (
+                <View key={i} style={[styles.sightingRow, i < SIGHTINGS.length - 1 && styles.sightingDivider]}>
+                  <View style={{ flex: 1, marginRight: 12 }}>
+                    <Text style={[T.h3, { color: C.text, fontSize: 17 }]}>{s.species}</Text>
+                    <Text style={[T.caption, { color: C.textMid, marginTop: 3 }]}>{s.location} · {s.date}</Text>
+                  </View>
+                  <View style={styles.badge}>
+                    <Text style={[T.label, { color: C.green, fontSize: 11 }]}>{s.confidence}%</Text>
+                  </View>
+                </View>
+              ))}
+            </ScrollView>
+          </View>
+
+      </ScrollView>
+
+      {/* Bottom action bar */}
+      <SafeAreaView edges={['bottom']} style={{ backgroundColor: C.surface }}>
+        <View style={styles.bottomBar}>
+          <View style={{ alignItems: 'center', paddingBottom: 10 }}>
+            <View style={styles.modelChip}>
+              <Ionicons name="sunny-outline" size={13} color={C.green} />
+              <Text style={[T.caption, { color: C.text, marginLeft: 6, marginRight: 4, fontSize: 12, fontFamily: 'Inter-Medium' }]}>
+                {selectedModel}
+              </Text>
+              <Ionicons name="chevron-down" size={13} color={C.textMid} />
+            </View>
+          </View>
+
+          <View style={styles.actionRow}>
+            <TouchableOpacity onPress={uploadAudio} disabled={isRecording || isProcessing} activeOpacity={0.7}
+              style={[styles.sideAction, (isRecording || isProcessing) && { opacity: 0.35 }]}>
+              <Ionicons name="arrow-up-outline" size={22} color={C.textMid} />
+              <Text style={[T.label, { color: C.textMid, marginTop: 3, fontSize: 10 }]}>UPLOAD</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid);
+                if (isProcessing) { cancel(); }
+                else if (isRecording) { stopRecording(); }
+                else {
+                  const onRecordTab = activePage === 1;
+                  if (!onRecordTab) goToPage(1);
+                  const doStart = () => {
+                    LayoutAnimation.configureNext({
+                      duration: 280,
+                      create: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+                      update: { type: LayoutAnimation.Types.easeInEaseOut },
+                    });
+                    setPendingRecord(true);
+                    startRecording();
+                  };
+                  if (onRecordTab) doStart();
+                  else setTimeout(doStart, 340);
+                  return; // haptics already called above
+                }
+              }}
+              activeOpacity={0.85}
+              style={[styles.recordPill, isRecording && styles.recordPillStop]}
+            >
+              <Ionicons name={(isRecording || isProcessing) ? 'stop' : 'mic'} size={20} color={C.pillText} />
+              <Text style={[T.title, { color: C.pillText, marginLeft: 9, fontSize: 16 }]}>
+                {isProcessing ? 'Cancel analysis' : isRecording ? 'Stop recording' : 'Record'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={() => { if (audioUri) { setWaveSelection(null); playAudio(); } }}
+              disabled={!audioUri || isProcessing} activeOpacity={0.7}
+              style={[styles.sideAction, (!audioUri || isProcessing) && { opacity: 0.35 }]}>
+              <Ionicons name={isPlaying ? 'pause' : 'play'} size={22} color={C.textMid} />
+              <Text style={[T.label, { color: C.textMid, marginTop: 3, fontSize: 10 }]}>PLAY</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </SafeAreaView>
     </SafeAreaView>
@@ -555,123 +688,70 @@ export default function App() {
 // Styles
 // ---------------------------------------------------------------------------
 const styles = StyleSheet.create({
-  safeArea:    { flex: 1, backgroundColor: C.bg },
-  pagesRow:    { position: 'absolute', top: 0, bottom: 0, left: 0, flexDirection: 'row', width: SW * 2 },
-  page:        { width: SW, height: '100%' },
-  hero:        { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  bottomPanel: { backgroundColor: C.surface, borderTopLeftRadius: 24, borderTopRightRadius: 24 },
+  safeArea: { flex: 1, backgroundColor: C.bg },
+  page:     { width: SW, height: '100%' },
 
-  fieldGuideBadge: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: C.yellow, borderRadius: 99,
-    paddingHorizontal: 14, paddingVertical: 7,
-    shadowColor: C.brown, shadowOffset: { width: 0, height: 2 }, shadowRadius: 4, shadowOpacity: 0.15, elevation: 3,
-  },
-  mascotCircle: {
-    width: 64, height: 64, borderRadius: 32,
-    borderWidth: 3, borderColor: C.green,
+  frogThumb: {
+    width: 64, height: 64, borderRadius: 14,
+    borderWidth: 3, borderColor: '#FFFFFF',
     backgroundColor: C.greenLight,
     alignItems: 'center', justifyContent: 'center',
   },
-  ribbitLabel: {
-    alignSelf: 'flex-start',
-    backgroundColor: C.white,
-    borderRadius: 99,
-    paddingHorizontal: 13, paddingVertical: 5,
-    marginLeft: 12, marginBottom: -12, zIndex: 1,
-    borderWidth: 1.5, borderColor: C.yellow,
-    shadowColor: C.brown, shadowOffset: { width: 0, height: 2 }, shadowRadius: 4, shadowOpacity: 0.15, elevation: 3,
-  },
 
-  btnWrapper:  { width: 124, height: 128, alignItems: 'center', justifyContent: 'center' },
-  ring: {
-    position: 'absolute', width: 120, height: 120, borderRadius: 28,
-    borderWidth: 2.5, borderColor: C.green,
+  topSection: {
+    paddingTop: 14, paddingBottom: 12, paddingHorizontal: 24,
+    backgroundColor: C.bg,
   },
-  recordBtn: {
-    width: 120, height: 120, borderRadius: 28,
-    alignItems: 'center', justifyContent: 'center',
-    shadowOffset: { width: 0, height: 6 }, shadowRadius: 16, shadowOpacity: 0.25, elevation: 10,
-  },
-  recordBtnCancel:       { backgroundColor: C.tabBg,  shadowColor: C.brownLight },
-  recordBtnIdle:         { backgroundColor: C.green,  shadowColor: C.green },
-  recordBtnActive:       { backgroundColor: C.coral,  shadowColor: C.coral },
-  recordBtnShadowIdle:   { backgroundColor: '#3d6b30' },
-  recordBtnShadowActive: { backgroundColor: '#a05040' },
-  recordBtnShadowCancel: { backgroundColor: C.brownLight },
-
-  resultCard: {
-    backgroundColor: C.surface,
-    borderWidth: 1.5, borderColor: C.border,
-    borderRadius: 22, overflow: 'hidden',
-    shadowColor: C.brown, shadowOffset: { width: 0, height: 4 }, shadowRadius: 12, shadowOpacity: 0.1, elevation: 5,
-  },
-  resultCardHeader: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: C.mint, paddingHorizontal: 16, paddingVertical: 12,
-  },
-  durationPill: {
-    backgroundColor: C.white, borderRadius: 99,
-    paddingHorizontal: 12, paddingVertical: 4,
+  tabRow: {
+    flexDirection: 'row', alignSelf: 'center',
+    backgroundColor: C.surface, borderRadius: 99,
+    padding: 4, marginTop: 14,
     borderWidth: 1, borderColor: C.border,
   },
-  frogSquareLarge: {
-    width: 80, height: 80, borderRadius: 18,
-    backgroundColor: C.greenLight, alignItems: 'center', justifyContent: 'center',
-  },
-  frogSquareSmall: {
-    width: 62, height: 62, borderRadius: 14,
-    backgroundColor: 'rgba(255,209,102,0.2)',
-    borderWidth: 1.5, borderColor: 'rgba(196,168,130,0.3)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  leafDivider:  { flexDirection: 'row', alignItems: 'center', gap: 10, marginVertical: 14 },
-  leafLine:     { flex: 1, height: 1, backgroundColor: C.border },
-  expandBtn:    { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, justifyContent: 'center' },
+  tabPill:       { paddingHorizontal: 18, paddingVertical: 8, borderRadius: 99 },
+  tabPillActive: { backgroundColor: C.pill },
 
-  confTrack: { height: 8, backgroundColor: 'rgba(61,50,38,0.08)', borderRadius: 99, overflow: 'hidden' },
+  card: {
+    backgroundColor: C.surface, borderRadius: 16, padding: 16,
+    shadowColor: '#6B4F2A', shadowOffset: { width: 0, height: 2 },
+    shadowRadius: 10, shadowOpacity: 0.10, elevation: 3,
+  },
+  cardHeaderRow: {
+    paddingBottom: 10,
+    borderBottomWidth: 1, borderBottomColor: C.border,
+  },
+  micCircle: {
+    width: 28, height: 28, borderRadius: 14,
+    backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center',
+  },
+
+  recDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.red },
+
+  divider:   { height: 1, backgroundColor: C.border, marginVertical: 12 },
+  confTrack: { height: 4, backgroundColor: C.border, borderRadius: 99, overflow: 'hidden' },
   confFill:  { height: '100%', backgroundColor: C.green, borderRadius: 99 },
 
-  uploadRow: { paddingHorizontal: 20, paddingBottom: 20, paddingTop: 4, gap: 8 },
-  dashedSeparator: {
-    borderWidth: 1.5, borderColor: C.border, borderStyle: 'dashed',
-    borderRadius: 1, marginBottom: 12,
-  },
-  uploadBtn: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    paddingVertical: 13, borderRadius: 16,
-    backgroundColor: C.surface, borderWidth: 1.5, borderColor: C.border,
-  },
-  uploadBtnDisabled: { opacity: 0.4 },
-  playBtn: { flex: 0, paddingHorizontal: 18, borderColor: C.green },
-
-  modelRow: { flexDirection: 'row', alignItems: 'center', paddingTop: 4 },
-  modelPill: {
-    paddingHorizontal: 12, paddingVertical: 5, borderRadius: 99,
-    borderWidth: 1.5, borderColor: C.border, backgroundColor: C.surface,
-  },
-  modelPillActive: { borderColor: C.green, backgroundColor: C.greenLight },
-
-  tabBar:  { flexDirection: 'row', borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.tabBg },
-  tabItem: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 10, zIndex: 1 },
-  tabPill: { position: 'absolute', top: 6, bottom: 6, width: SW / 2 - 8, borderRadius: 12, backgroundColor: C.greenLight },
-
-  aboutCard: {
-    backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 20, padding: 18,
-    shadowColor: C.brown, shadowOffset: { width: 0, height: 3 }, shadowRadius: 8, shadowOpacity: 0.06, elevation: 3,
-  },
-  avatar:          { width: 42, height: 42, borderRadius: 12, backgroundColor: C.greenLight, alignItems: 'center', justifyContent: 'center' },
-  badge:           { backgroundColor: C.greenLight, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3 },
-  sightingDivider: { borderBottomWidth: 1, borderBottomColor: C.border, marginBottom: 12 },
-
-  acDialogue: {
+  bottomBar: {
+    paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6,
+    borderTopWidth: 1, borderTopColor: C.border,
     backgroundColor: C.surface,
-    borderWidth: 2.5, borderColor: C.brownLight,
-    borderRadius: 18, padding: 16,
-    shadowColor: C.brownLight,
-    shadowOffset: { width: 0, height: 4 }, shadowRadius: 0, shadowOpacity: 1,
-    elevation: 6,
   },
+  modelChip: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: C.bg, borderRadius: 99,
+    paddingHorizontal: 14, paddingVertical: 7,
+    borderWidth: 1, borderColor: C.border,
+  },
+  actionRow:  { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  sideAction: { width: 60, alignItems: 'center', justifyContent: 'center', paddingVertical: 6 },
+  recordPill: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    backgroundColor: C.pill, borderRadius: 99, paddingVertical: 15,
+  },
+  recordPillStop: { backgroundColor: C.red },
 
-  cloud: { position: 'absolute' },
+  avatar:          { width: 40, height: 40, borderRadius: 20, backgroundColor: C.greenLight, alignItems: 'center', justifyContent: 'center' },
+  badge:           { backgroundColor: C.greenLight, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
+  sightingRow:     { paddingVertical: 14 },
+  sightingDivider: { borderBottomWidth: 1, borderBottomColor: C.border },
 });

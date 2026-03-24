@@ -31,7 +31,13 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
   const [expandedResults, setExpandedResults] = useState(false);
   const [audioUri,        setAudioUri]        = useState(null);
 
+  const [audioLevel,      setAudioLevel]      = useState(0);
+  const [waveformSamples,     setWaveformSamples]     = useState([]);
+  const [waveformFrogBuckets, setWaveformFrogBuckets] = useState([]);
+  const [waveformFrogLabels,  setWaveformFrogLabels]  = useState([]);
+
   const cancelRef        = useRef(false);
+  const levelTimerRef    = useRef(null);
   const progressAnim     = useRef(new Animated.Value(0)).current;
   const progressFadeAnim = useRef(new Animated.Value(0)).current;
   const resultDropAnim   = useRef(new Animated.Value(1)).current;
@@ -100,7 +106,20 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
     const mono      = decodePcm(bytes, dataOffset, numChannels);
     const audioData = resample(mono, fileSr, SR);
 
-    setStatus('Classifying...');
+    // Build waveform thumbnail (80 RMS buckets for display)
+    const WAVE_POINTS = 80;
+    const bucketSize  = Math.floor(audioData.length / WAVE_POINTS);
+    const waveSamples = [];
+    for (let i = 0; i < WAVE_POINTS; i++) {
+      let sumSq = 0;
+      const off = i * bucketSize;
+      for (let j = off; j < off + bucketSize && j < audioData.length; j++) sumSq += audioData[j] * audioData[j];
+      waveSamples.push(Math.sqrt(sumSq / bucketSize));
+    }
+    const wavePeak = Math.max(...waveSamples, 0.001);
+    setWaveformSamples(waveSamples.map(s => s / wavePeak));
+
+    setStatus('Starting...');
     const totalWindows = Math.max(0, Math.floor((audioData.length - WIN_SAMPLES) / STRIDE_SAMPLES) + 1);
 
     progressFadeAnim.setValue(0);
@@ -152,13 +171,21 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
         labelCounts[pred.label] = (labelCounts[pred.label] || 0) + 1;
       }
 
+      // Ticker status: show leading detection every 5 windows
+      if (windowIdx % 5 === 0) {
+        const leading = Object.entries(labelCounts).sort(([, a], [, b]) => b - a)[0];
+        setStatus(leading
+          ? `${leading[0]} · ${windowIdx}/${totalWindows}`
+          : `Background · ${windowIdx}/${totalWindows}`
+        );
+        await new Promise(r => setTimeout(r, 0));
+      }
+
       // Early stopping — if the leading label can't be beaten by all remaining
       // windows going to 2nd place, the result is already decided
       const remaining = totalWindows - windowIdx;
       const sorted = Object.values(labelCounts).sort((a, b) => b - a);
       if (sorted.length >= 1 && sorted[0] - (sorted[1] ?? 0) > remaining) break;
-
-      if (windowIdx % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
     progAnim.stop();
@@ -168,21 +195,34 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
     await new Promise(r =>
       Animated.timing(progressFadeAnim, { toValue: 0, duration: 240, useNativeDriver: true }).start(r)
     );
-    LayoutAnimation.configureNext(LAYOUT_MOVE);
     setProgress(null);
 
     setIsProcessing(false);
     if (cancelRef.current) { setStatus('Cancelled'); return; }
     if (!windowPredictions.length) { setStatus('Audio too short to classify'); return; }
 
-    setAudioDuration(Math.round(audioData.length / SR));
+    const totalSec = audioData.length / SR;
+    setAudioDuration(Math.round(totalSec));
     const result = majorityVote(windowPredictions);
+
+    // Compute per-bucket frog detection for waveform colouring
+    const frogBuckets = new Array(WAVE_POINTS).fill(false);
+    const frogLabels  = new Array(WAVE_POINTS).fill(null);
+    windowPredictions.forEach((pred, idx) => {
+      if (pred.label !== 'Background') {
+        const startSec = (idx * STRIDE_SAMPLES) / SR;
+        const bi = Math.min(WAVE_POINTS - 1, Math.floor(startSec / totalSec * WAVE_POINTS));
+        frogBuckets[bi] = true;
+        if (!frogLabels[bi]) frogLabels[bi] = pred.label; // first species per bucket
+      }
+    });
+    setWaveformFrogBuckets(frogBuckets);
+    setWaveformFrogLabels(frogLabels);
 
     setExpandedResults(false);
     resultDropAnim.setValue(0);
-    LayoutAnimation.configureNext(LAYOUT_MOVE);
     setPrediction(result);
-    Animated.timing(resultDropAnim, { toValue: 1, duration: 320, useNativeDriver: true }).start();
+    Animated.timing(resultDropAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
     setStatus('');
 
     Haptics.notificationAsync(
@@ -196,6 +236,7 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
   // startRecording / stopRecording / uploadAudio
   // -------------------------------------------------------------------------
   const startRecording = async () => {
+    if (playerStatus.playing) player.pause();
     dropAndClearPrediction(async () => {
       try {
         setStatus('Requesting permission...');
@@ -206,6 +247,13 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
         await audioRecorder.prepareToRecordAsync();
         audioRecorder.record();
         setStatus('Recording');
+        levelTimerRef.current = setInterval(async () => {
+          try {
+            const s = await audioRecorder.getStatus();
+            const db = s?.currentMeteringInfo?.currentLevel ?? -160;
+            setAudioLevel(Math.max(0, Math.min(1, (db + 60) / 60)));
+          } catch { /* ignore */ }
+        }, 100);
       } catch (err) {
         setStatus(`Error: ${err.message}`);
       }
@@ -213,6 +261,11 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
   };
 
   const stopRecording = async () => {
+    clearInterval(levelTimerRef.current);
+    setAudioLevel(0);
+    setIsProcessing(true); // prevent idle flash while async stop completes
+    // Release recording audio session immediately so speaker routes correctly
+    await AudioModule.setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => {});
     try {
       setStatus('Processing...');
       let uri;
@@ -231,6 +284,18 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
     } catch (err) {
       setStatus(`Error: ${err.message}`);
     }
+  };
+
+  const seekAudio = async (positionSeconds) => {
+    if (!audioUri) return;
+    try {
+      await AudioModule.setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+      if (!playerStatus.playing) {
+        player.replace({ uri: audioUri });
+        player.play();
+      }
+      player.seekTo(positionSeconds);
+    } catch {}
   };
 
   const uploadAudio = async () => {
@@ -255,6 +320,9 @@ export function useAudioProcessor(selectedModel = MODEL_NAMES[0]) {
     prediction, status, progress, audioDuration, isProcessing,
     expandedResults, setExpandedResults,
     isRecording: audioRecorder.isRecording,
+    audioLevel, waveformSamples, waveformFrogBuckets, waveformFrogLabels,
+    playbackPositionSecs: (playerStatus.positionMillis ?? 0) / 1000,
+    seekAudio,
     audioUri,
     isPlaying: playerStatus.playing,
     progressAnim, progressFadeAnim, resultDropAnim,
